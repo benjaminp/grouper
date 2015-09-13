@@ -1,3 +1,8 @@
+from django.shortcuts import redirect, render
+from django.http import HttpResponse
+
+# Create your views here.
+
 from datetime import datetime, timedelta
 import operator
 
@@ -37,22 +42,23 @@ from ..models import (
     get_user_or_group, Audit, AuditMember, AUDIT_STATUS_CHOICES,
 )
 from .settings import settings
-from .util import ensure_audit_security, GrouperHandler, Alert, test_reserved_names
+from .util import ensure_audit_security, Alert, test_reserved_names, GrouperView
 from ..util import matches_glob
 
 
-class Index(GrouperHandler):
-    def get(self):
+class Index(GrouperView):
+    def get(self, request):
         # For now, redirect to viewing your own profile. TODO: maybe have a
         # Grouper home page where you can maybe do stuff?
-        return self.redirect("/users/{}".format(self.current_user.name))
+        user = self.get_current_user()
+        return redirect("/users/{}".format(user.username))
 
 
-class Search(GrouperHandler):
-    def get(self):
-        query = self.get_argument("query", "")
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 100))
+class Search(GrouperView):
+    def get(self, request):
+        query = request.GET.get("query", "")
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 100))
         if limit > 9000:
             limit = 9000
 
@@ -84,15 +90,15 @@ class Search(GrouperHandler):
 
         if len(results) == 1:
             result = results[0]
-            return self.redirect("/{}s/{}".format(result.type.lower(), result.name))
+            return redirect(("/{}s/{}".format(result.type.lower(), result.name)))
 
-        self.render("search.html", results=results, search_query=query,
+        return self.render(request, "search.html", results=results, search_query=query,
                     offset=offset, limit=limit, total=total)
 
 
-class UserView(GrouperHandler):
-    def get(self, user_id=None, name=None):
-        self.handle_refresh()
+class UserView(GrouperView):
+    def get(self, request, user_id=None, name=None):
+        #self.handle_refresh()
         user = User.get(self.session, user_id, name)
         if user_id is not None:
             user = self.session.query(User).filter_by(id=user_id).scalar()
@@ -100,7 +106,7 @@ class UserView(GrouperHandler):
             user = self.session.query(User).filter_by(username=name).scalar()
 
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         can_control = False
         if (user.name == self.current_user.name) or self.current_user.user_admin:
@@ -122,29 +128,31 @@ class UserView(GrouperHandler):
         public_keys = user.my_public_keys()
         permissions = user_md.get('permissions', [])
         log_entries = user.my_log_entries()
-        self.render("user.html", user=user, groups=groups, public_keys=public_keys,
+        return self.render(request, "user.html", user=user, groups=groups, public_keys=public_keys,
                     can_control=can_control, permissions=permissions,
                     log_entries=log_entries, num_pending_requests=num_pending_requests)
 
 
-class PermissionsCreate(GrouperHandler):
-    def get(self):
+class PermissionsCreate(GrouperView):
+    def get(self, request):
         can_create = self.current_user.my_creatable_permissions()
         if not can_create:
-            return self.forbidden()
+            raise PermissionDenied
 
-        return self.render(
-            "permission-create.html", form=PermissionCreateForm(), can_create=can_create,
+        return self.render(request, 
+            "permission-create.html",
+            form=PermissionCreateForm(),
+            can_create=can_create,
         )
 
-    def post(self):
+    def post(self, request):
         can_create = self.current_user.my_creatable_permissions()
         if not can_create:
-            return self.forbidden()
+            raise PermissionDenied
 
-        form = PermissionCreateForm(self.request.arguments)
+        form = PermissionCreateForm(request.POST)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "permission-create.html", form=form,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -166,7 +174,7 @@ class PermissionsCreate(GrouperHandler):
             )
 
         if form.name.errors:
-            return self.render(
+            return self.render(request, 
                 "permission-create.html", form=form,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -180,7 +188,7 @@ class PermissionsCreate(GrouperHandler):
             form.name.errors.append(
                 "Name already in use. Permissions must be unique."
             )
-            return self.render(
+            return self.render(request, 
                 "permission-create.html", form=form, can_create=can_create,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -191,17 +199,18 @@ class PermissionsCreate(GrouperHandler):
                      'Created permission.', on_permission_id=permission.id)
 
         # No explicit refresh because handler queries SQL.
-        return self.redirect("/permissions/{}".format(permission.name))
+        return redirect("/permissions/{}".format(permission.name))
 
 
-class PermissionDisableAuditing(GrouperHandler):
-    def post(self, user_id=None, name=None):
+class PermissionDisableAuditing(GrouperView):
+    def post(self, request, user_id=None, name=None):
         if not self.current_user.permission_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
         permission = Permission.get(self.session, name)
         if not permission:
-            return self.notfound()
+            # XXX(lfaraone)
+            return HttpResponse("404")
 
         permission.disable_auditing()
         self.session.commit()
@@ -210,17 +219,18 @@ class PermissionDisableAuditing(GrouperHandler):
                      'Disabled auditing.', on_permission_id=permission.id)
 
         # No explicit refresh because handler queries SQL.
-        return self.redirect("/permissions/{}".format(permission.name))
+        return redirect("/permissions/{}".format(permission.name))
 
 
-class PermissionEnableAuditing(GrouperHandler):
-    def post(self, name=None):
+class PermissionEnableAuditing(GrouperView):
+    def post(self, request, name=None):
         if not self.current_user.permission_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
         permission = Permission.get(self.session, name)
         if not permission:
-            return self.notfound()
+            # XXX(lfaraone)
+            return HttpResponse("404")
 
         permission.enable_auditing()
         self.session.commit()
@@ -229,18 +239,19 @@ class PermissionEnableAuditing(GrouperHandler):
                      'Enabled auditing.', on_permission_id=permission.id)
 
         # No explicit refresh because handler queries SQL.
-        return self.redirect("/permissions/{}".format(permission.name))
+        return redirect("/permissions/{}".format(permission.name))
 
 
-class PermissionsGrant(GrouperHandler):
-    def get(self, name=None):
+class PermissionsGrant(GrouperView):
+    def get(self, request, name=None):
         grantable = self.current_user.my_grantable_permissions()
         if not grantable:
-            return self.forbidden()
+            raise PermissionDenied
 
         group = Group.get(self.session, None, name)
         if not group:
-            return self.notfound()
+            # XXX(lfaraone)
+            return HttpResponse("404")
 
         form = PermissionGrantForm()
         form.permission.choices = [["", "(select one)"]]
@@ -248,34 +259,36 @@ class PermissionsGrant(GrouperHandler):
             grantable = "{} ({})".format(perm[0].name, perm[1])
             form.permission.choices.append([perm[0].name, grantable])
 
-        return self.render(
+        return self.render(request, 
             "permission-grant.html", form=form, group=group,
         )
 
-    def post(self, name=None):
+    def post(self, request, name=None):
         grantable = self.current_user.my_grantable_permissions()
         if not grantable:
-            return self.forbidden()
+            raise PermissionDenied
 
         group = Group.get(self.session, None, name)
         if not group:
-            return self.notfound()
+            # XXX(lfaraone)
+            return HttpResponse("404")
 
-        form = PermissionGrantForm(self.request.arguments)
+        form = PermissionGrantForm(request.POST)
         form.permission.choices = [["", "(select one)"]]
         for perm in grantable:
             grantable_str = "{} ({})".format(perm[0].name, perm[1])
             form.permission.choices.append([perm[0].name, grantable_str])
 
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "permission-grant.html", form=form, group=group,
                 alerts=self.get_form_alerts(form.errors)
             )
 
         permission = Permission.get(self.session, form.data["permission"])
         if not permission:
-            return self.notfound()  # Shouldn't happen.
+            # XXX(lfaraone)
+            return HttpResponse("404")
 
         allowed = False
         for perm in grantable:
@@ -286,7 +299,7 @@ class PermissionsGrant(GrouperHandler):
             form.argument.errors.append(
                 "You do not have grant authority over that permission/argument combination."
             )
-            return self.render(
+            return self.render(request, 
                 "permission-grant.html", form=form, group=group,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -302,7 +315,7 @@ class PermissionsGrant(GrouperHandler):
                 fail_message = e
             if not permission_ok:
                 form.permission.errors.append(fail_message)
-                return self.render(
+                return self.render(request, 
                     "permission-grant.html", form=form, group=group,
                     alerts=self.get_form_alerts(form.errors),
                 )
@@ -313,7 +326,7 @@ class PermissionsGrant(GrouperHandler):
             form.argument.errors.append(
                 "Permission and Argument already mapped to this group."
             )
-            return self.render(
+            return self.render(request, 
                 "permission-grant.html", form=form, group=group,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -324,18 +337,19 @@ class PermissionsGrant(GrouperHandler):
                      'Granted permission with argument: {}'.format(form.data["argument"]),
                      on_permission_id=permission.id, on_group_id=group.id)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class PermissionsRevoke(GrouperHandler):
-    def get(self, name=None, mapping_id=None):
+class PermissionsRevoke(GrouperView):
+    def get(self, request, name=None, mapping_id=None):
         grantable = self.current_user.my_grantable_permissions()
         if not grantable:
-            return self.forbidden()
+            raise PermissionDenied
 
         mapping = PermissionMap.get(self.session, id=mapping_id)
         if not mapping:
-            return self.notfound()
+            # XXX(lfaraone)
+            return HttpResponse("404")
 
         allowed = False
         for perm in grantable:
@@ -343,18 +357,18 @@ class PermissionsRevoke(GrouperHandler):
                 if matches_glob(perm[1], mapping.argument):
                     allowed = True
         if not allowed:
-            return self.forbidden()
+            raise PermissionDenied
 
-        self.render("permission-revoke.html", mapping=mapping)
+        return self.render(request, "permission-revoke.html", mapping=mapping)
 
-    def post(self, name=None, mapping_id=None):
+    def post(self, request, name=None, mapping_id=None):
         grantable = self.current_user.my_grantable_permissions()
         if not grantable:
-            return self.forbidden()
+            raise PermissionDenied
 
         mapping = PermissionMap.get(self.session, id=mapping_id)
         if not mapping:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         allowed = False
         for perm in grantable:
@@ -362,7 +376,7 @@ class PermissionsRevoke(GrouperHandler):
                 if matches_glob(perm[1], mapping.argument):
                     allowed = True
         if not allowed:
-            return self.forbidden()
+            raise PermissionDenied
 
         permission = mapping.permission
         group = mapping.group
@@ -374,18 +388,18 @@ class PermissionsRevoke(GrouperHandler):
                      'Revoked permission with argument: {}'.format(mapping.argument),
                      on_group_id=group.id, on_permission_id=permission.id)
 
-        return self.redirect('/groups/{}?refresh=yes'.format(group.name))
+        return redirect(('/groups/{}?refresh=yes'.format(group.name)))
 
 
-class PermissionsView(GrouperHandler):
+class PermissionsView(GrouperView):
     '''
     Controller for viewing the major permissions list. There is no privacy here; the existence of
     a permission is public.
     '''
-    def get(self, audited_only=False):
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 100))
-        audited_only = bool(int(self.get_argument("audited", 0)))
+    def get(self, request, audited_only=False):
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 100))
+        audited_only = bool(int(request.GET.get("audited", 0)))
         if limit > 9000:
             limit = 9000
 
@@ -395,35 +409,35 @@ class PermissionsView(GrouperHandler):
 
         can_create = self.current_user.my_creatable_permissions()
 
-        self.render(
+        return self.render(request, 
             "permissions.html", permissions=permissions, offset=offset, limit=limit, total=total,
             can_create=can_create, audited_permissions=audited_only
         )
 
 
-class PermissionView(GrouperHandler):
-    def get(self, name=None):
+class PermissionView(GrouperView):
+    def get(self, request, name=None):
         # TODO: use cached data instead, add refresh to appropriate redirects.
         permission = Permission.get(self.session, name)
         if not permission:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         can_delete = self.current_user.permission_admin
         mapped_groups = permission.get_mapped_groups()
         log_entries = permission.my_log_entries()
 
-        self.render(
+        return self.render(request, 
             "permission.html", permission=permission, can_delete=can_delete,
             mapped_groups=mapped_groups, log_entries=log_entries,
         )
 
 
-class UsersView(GrouperHandler):
-    def get(self):
+class UsersView(GrouperView):
+    def get(self, request):
         # TODO: use cached users instead.
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 100))
-        enabled = bool(int(self.get_argument("enabled", 1)))
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 100))
+        enabled = bool(int(request.GET.get("enabled", 1)))
         if limit > 9000:
             limit = 9000
 
@@ -435,16 +449,16 @@ class UsersView(GrouperHandler):
         total = users.count()
         users = users.offset(offset).limit(limit).all()
 
-        self.render(
+        return self.render(request, 
             "users.html", users=users, offset=offset, limit=limit, total=total,
             enabled=enabled,
         )
 
 
-class UsersPublicKey(GrouperHandler):
+class UsersPublicKey(GrouperView):
     @ensure_audit_security(u'public_keys')
-    def get(self):
-        form = UsersPublicKeyForm(self.request.arguments)
+    def get(self, request):
+        form = UsersPublicKeyForm(request.POST)
 
         user_key_list = self.session.query(
             PublicKey,
@@ -459,7 +473,7 @@ class UsersPublicKey(GrouperHandler):
             total = user_key_list.count()
             user_key_list = user_key_list.offset(form.offset.default).limit(form.limit.default)
 
-            return self.render("users-publickey.html", user_key_list=user_key_list, total=total,
+            return self.render(request, "users-publickey.html", user_key_list=user_key_list, total=total,
                     form=form, alerts=self.get_form_alerts(form.errors))
 
         user_key_list = user_key_list.filter(User.enabled == bool(form.enabled.data))
@@ -479,17 +493,17 @@ class UsersPublicKey(GrouperHandler):
         total = user_key_list.count()
         user_key_list = user_key_list.offset(form.offset.data).limit(form.limit.data)
 
-        self.render("users-publickey.html", user_key_list=user_key_list, total=total, form=form)
+        return self.render(request, "users-publickey.html", user_key_list=user_key_list, total=total, form=form)
 
 
-class UserEnable(GrouperHandler):
-    def post(self, user_id=None, name=None):
+class UserEnable(GrouperView):
+    def post(self, request, user_id=None, name=None):
         if not self.current_user.user_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
         user = User.get(self.session, user_id, name)
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         user.enable()
         self.session.commit()
@@ -497,18 +511,18 @@ class UserEnable(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'enable_user',
                      'Enabled user.', on_user_id=user.id)
 
-        return self.redirect("/users/{}?refresh=yes".format(user.name))
+        return redirect(("/users/{}?refresh=yes".format(user.name)))
 
 
-class UserDisable(GrouperHandler):
-    def post(self, user_id=None, name=None):
+class UserDisable(GrouperView):
+    def post(self, request, user_id=None, name=None):
 
         if not self.current_user.user_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
         user = User.get(self.session, user_id, name)
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         user.disable(self.current_user)
         self.session.commit()
@@ -516,14 +530,14 @@ class UserDisable(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'disable_user',
                      'Disabled user.', on_user_id=user.id)
 
-        return self.redirect("/users/{}?refresh=yes".format(user.name))
+        return redirect("/users/{}?refresh=yes".format(user.name))
 
 
-class UserRequests(GrouperHandler):
+class UserRequests(GrouperView):
     """Handle list all pending requests for a single user."""
-    def get(self):
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 100))
+    def get(self, request):
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 100))
         if limit > 9000:
             limit = 9000
 
@@ -532,16 +546,16 @@ class UserRequests(GrouperHandler):
         total = requests.count()
         requests = requests.offset(offset).limit(limit)
 
-        self.render("user-requests.html", requests=requests, offset=offset, limit=limit,
+        return self.render(request, "user-requests.html", requests=requests, offset=offset, limit=limit,
                 total=total)
 
 
-class GroupView(GrouperHandler):
-    def get(self, group_id=None, name=None):
+class GroupView(GrouperView):
+    def get(self, request, group_id=None, name=None):
         self.handle_refresh()
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         grantable = self.current_user.my_grantable_permissions()
 
@@ -573,7 +587,7 @@ class GroupView(GrouperHandler):
         if self_pending:
             alerts.append(Alert('info', 'You have a pending request to join this group.', None))
 
-        self.render(
+        return self.render(request, 
             "group.html", group=group, members=members, groups=groups,
             num_pending=num_pending, alerts=alerts, permissions=permissions,
             log_entries=log_entries, grantable=grantable, audited=audited,
@@ -581,23 +595,23 @@ class GroupView(GrouperHandler):
         )
 
 
-class GroupEditMember(GrouperHandler):
-    def get(self, group_id=None, name=None, name2=None, member_type=None):
+class GroupEditMember(GrouperView):
+    def get(self, request, group_id=None, name=None, name2=None, member_type=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if self.current_user.name == name2:
-            return self.forbidden()
+            raise PermissionDenied
 
         members = group.my_members()
         my_role = self.current_user.my_role(members)
         if my_role not in ("manager", "owner", "np-owner"):
-            return self.forbidden()
+            raise PermissionDenied
 
         member = members.get((member_type.capitalize(), name2), None)
         if not member:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         edge = GroupEdge.get(
             self.session,
@@ -606,9 +620,9 @@ class GroupEditMember(GrouperHandler):
             member_pk=member.id,
         )
         if not edge:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        form = GroupEditMemberForm(self.request.arguments)
+        form = GroupEditMemberForm(request.POST)
         form.role.choices = [["member", "Member"]]
         if my_role in ("owner", "np-owner"):
             form.role.choices.append(["manager", "Manager"])
@@ -618,33 +632,33 @@ class GroupEditMember(GrouperHandler):
         form.role.data = edge.role
         form.expiration.data = edge.expiration.strftime("%m/%d/%Y") if edge.expiration else None
 
-        self.render(
+        return self.render(request, 
             "group-edit-member.html", group=group, member=member, edge=edge, form=form,
         )
 
-    def post(self, group_id=None, name=None, name2=None, member_type=None):
+    def post(self, request, group_id=None, name=None, name2=None, member_type=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if self.current_user.name == name2:
-            return self.forbidden()
+            raise PermissionDenied
 
         members = group.my_members()
         my_role = self.current_user.my_role(members)
         if my_role not in ("manager", "owner", "np-owner"):
-            return self.forbidden()
+            raise PermissionDenied
 
         member = members.get((member_type.capitalize(), name2), None)
         if not member:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if member.type == "Group":
             user_or_group = Group.get(self.session, member.id)
         else:
             user_or_group = User.get(self.session, member.id)
         if not user_or_group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         edge = GroupEdge.get(
             self.session,
@@ -653,9 +667,9 @@ class GroupEditMember(GrouperHandler):
             member_pk=member.id,
         )
         if not edge:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        form = GroupEditMemberForm(self.request.arguments)
+        form = GroupEditMemberForm(request.POST)
         form.role.choices = [["member", "Member"]]
         if my_role in ("owner", "np-owner"):
             form.role.choices.append(["manager", "Manager"])
@@ -663,7 +677,7 @@ class GroupEditMember(GrouperHandler):
             form.role.choices.append(["np-owner", "No-Permissions Owner"])
 
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "group-edit-member.html", group=group, member=member, edge=edge, form=form,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -675,7 +689,7 @@ class GroupEditMember(GrouperHandler):
             user_can_join = False
             fail_message = e
         if not user_can_join:
-            return self.render(
+            return self.render(request, 
                 "group-edit-member.html", form=form, group=group, member=member, edge=edge,
                 alerts=[
                     Alert('danger', fail_message, 'Audit Policy Enforcement')
@@ -689,56 +703,56 @@ class GroupEditMember(GrouperHandler):
         group.edit_member(self.current_user, user_or_group, form.data["reason"],
                           role=form.data["role"], expiration=expiration)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class GroupRequestUpdate(GrouperHandler):
-    def get(self, request_id, group_id=None, name=None):
+class GroupRequestUpdate(GrouperView):
+    def get(self, request, request_id, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         members = group.my_members()
         my_role = self.current_user.my_role(members)
         if my_role not in ("manager", "owner", "np-owner"):
-            return self.forbidden()
+            raise PermissionDenied
 
         request = self.session.query(Request).filter_by(id=request_id).scalar()
         if not request:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        form = GroupRequestModifyForm(self.request.arguments)
+        form = GroupRequestModifyForm(request.POST)
         form.status.choices = self._get_choices(request.status)
 
 
         updates = request.my_status_updates()
 
-        self.render(
+        return self.render(request, 
             "group-request-update.html", group=group, request=request,
             members=members, form=form, statuses=REQUEST_STATUS_CHOICES, updates=updates
         )
 
-    def post(self, request_id, group_id=None, name=None):
+    def post(self, request, request_id, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         members = group.my_members()
         my_role = self.current_user.my_role(members)
         if my_role not in ("manager", "owner", "np-owner"):
-            return self.forbidden()
+            raise PermissionDenied
 
         request = self.session.query(Request).filter_by(id=request_id).scalar()
         if not request:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        form = GroupRequestModifyForm(self.request.arguments)
+        form = GroupRequestModifyForm(request.POST)
         form.status.choices = self._get_choices(request.status)
 
         updates = request.my_status_updates()
 
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "group-request-update.html", group=group, request=request,
                 members=members, form=form, alerts=self.get_form_alerts(form.errors),
                 statuses=REQUEST_STATUS_CHOICES, updates=updates
@@ -755,7 +769,7 @@ class GroupRequestUpdate(GrouperHandler):
                 user_can_join = False
                 fail_message = e
             if not user_can_join:
-                return self.render(
+                return self.render(request, 
                     "group-request-update.html", group=group, request=request,
                     members=members, form=form, statuses=REQUEST_STATUS_CHOICES, updates=updates,
                     alerts=[
@@ -776,9 +790,9 @@ class GroupRequestUpdate(GrouperHandler):
 
         # No explicit refresh because handler queries SQL.
         if form.data['redirect_aggregate']:
-            return self.redirect("/user/requests")
+            return redirect("/user/requests")
         else:
-            return self.redirect("/groups/{}/requests".format(group.name))
+            return redirect("/groups/{}/requests".format(group.name))
 
     def _get_choices(self, current_status):
         return [["", ""]] + [
@@ -787,15 +801,15 @@ class GroupRequestUpdate(GrouperHandler):
         ]
 
 
-class GroupRequests(GrouperHandler):
-    def get(self, group_id=None, name=None):
+class GroupRequests(GrouperView):
+    def get(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        status = self.get_argument("status", None)
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 100))
+        status = request.GET.get("status", None)
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 100))
         if limit > 9000:
             limit = 9000
 
@@ -807,27 +821,27 @@ class GroupRequests(GrouperHandler):
         total = requests.count()
         requests = requests.offset(offset).limit(limit)
 
-        self.render(
+        return self.render(request, 
             "group-requests.html", group=group, requests=requests,
             members=members, status=status, statuses=REQUEST_STATUS_CHOICES,
             offset=offset, limit=limit, total=total
         )
 
 
-class AuditsComplete(GrouperHandler):
-    def post(self, audit_id):
+class AuditsComplete(GrouperView):
+    def post(self, request, audit_id):
         user = self.get_current_user()
         if not user.has_permission(PERMISSION_AUDITOR):
-            return self.forbidden()
+            raise PermissionDenied
 
         audit = self.session.query(Audit).filter(Audit.id == audit_id).one()
         if audit.complete:
-            return self.redirect("/groups/{}".format(audit.group.name))
+            return redirect("/groups/{}".format(audit.group.name))
 
         edges = {}
-        for argument in self.request.arguments:
+        for argument in request.POST:
             if argument.startswith('audit_'):
-                edges[int(argument.split('_')[1])] = self.request.arguments[argument][0]
+                edges[int(argument.split('_')[1])] = request.POST[argument][0]
 
         for member in audit.my_members():
             if member.id in edges:
@@ -843,7 +857,7 @@ class AuditsComplete(GrouperHandler):
         # Now if it's completable (no pendings) then mark it complete, else redirect them
         # to the group page.
         if not audit.completable:
-            return self.redirect('/groups/{}'.format(audit.group.name))
+            return redirect('/groups/{}'.format(audit.group.name))
 
         # Complete audits have to be "enacted" now. This means anybody marked as remove has to
         # be removed from the group now.
@@ -864,30 +878,30 @@ class AuditsComplete(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'complete_audit',
                      'Completed group audit.', on_group_id=audit.group.id)
 
-        return self.redirect('/groups/{}'.format(audit.group.name))
+        return redirect('/groups/{}'.format(audit.group.name))
 
 
-class AuditsCreate(GrouperHandler):
-    def get(self):
+class AuditsCreate(GrouperView):
+    def get(self, request):
         user = self.get_current_user()
         if not user.has_permission(AUDIT_MANAGER):
-            return self.forbidden()
+            raise PermissionDenied
 
-        self.render(
+        return self.render(request, 
             "audit-create.html", form=AuditCreateForm(),
         )
 
-    def post(self):
-        form = AuditCreateForm(self.request.arguments)
+    def post(self, request):
+        form = AuditCreateForm(request.POST)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "audit-create.html", form=form,
                 alerts=self.get_form_alerts(form.errors)
             )
 
         user = self.get_current_user()
         if not user.has_permission(AUDIT_MANAGER):
-            return self.forbidden()
+            raise PermissionDenied
 
         # Step 1, detect if there are non-completed audits and fail if so.
         open_audits = self.session.query(Audit).filter(
@@ -972,17 +986,17 @@ class AuditsCreate(GrouperHandler):
                     async_key='audit-{}'.format(group.id),
                 )
 
-        return self.redirect("/audits")
+        return redirect("/audits")
 
 
-class AuditsView(GrouperHandler):
-    def get(self):
+class AuditsView(GrouperView):
+    def get(self, request):
         user = self.get_current_user()
         if not (user.has_permission(AUDIT_VIEWER) or user.has_permission(AUDIT_MANAGER)):
-            return self.forbidden()
+            raise PermissionDenied
 
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 50))
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 50))
         if limit > 200:
             limit = 200
 
@@ -991,7 +1005,7 @@ class AuditsView(GrouperHandler):
             .order_by(Audit.started_at)
         )
 
-        open_filter = self.get_argument("filter", "Open Audits")
+        open_filter = request.GET.get("filter", "Open Audits")
         if open_filter == "Open Audits":
             audits = audits.filter(Audit.complete == False)
 
@@ -1003,19 +1017,19 @@ class AuditsView(GrouperHandler):
             Audit.complete == False).all()
         can_start = user.has_permission(AUDIT_MANAGER)
 
-        self.render(
+        return self.render(request, 
             "audits.html", audits=audits, filter=open_filter, can_start=can_start,
             offset=offset, limit=limit, total=total, open_audits=open_audits,
         )
 
 
-class GroupsView(GrouperHandler):
-    def get(self):
+class GroupsView(GrouperView):
+    def get(self, request):
         self.handle_refresh()
-        offset = int(self.get_argument("offset", 0))
-        limit = int(self.get_argument("limit", 100))
-        enabled = bool(int(self.get_argument("enabled", 1)))
-        audited_only = bool(int(self.get_argument("audited", 0)))
+        offset = int(request.GET.get("offset", 0))
+        limit = int(request.GET.get("limit", 100))
+        enabled = bool(int(request.GET.get("enabled", 1)))
+        audited_only = bool(int(request.GET.get("audited", 0)))
         if limit > 9000:
             limit = 9000
 
@@ -1034,21 +1048,21 @@ class GroupsView(GrouperHandler):
 
         form = GroupCreateForm()
 
-        self.render(
+        return self.render(request, 
             "groups.html", groups=groups, form=form,
             offset=offset, limit=limit, total=total, audited_groups=audited_only,
             directly_audited_groups=directly_audited_groups, enabled=enabled,
         )
 
-    def post(self):
-        form = GroupCreateForm(self.request.arguments)
+    def post(self, request):
+        form = GroupCreateForm(request.POST)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "group-create.html", form=form,
                 alerts=self.get_form_alerts(form.errors)
             )
 
-        user = self.get_current_user()
+        user = self.current_user
 
         group = Group(
             groupname=form.data["groupname"],
@@ -1063,7 +1077,7 @@ class GroupsView(GrouperHandler):
             form.groupname.errors.append(
                 "{} already exists".format(form.data["groupname"])
             )
-            return self.render(
+            return self.render(request, 
                 "group-create.html", form=form,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -1074,11 +1088,11 @@ class GroupsView(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'create_group',
                      'Created new group.', on_group_id=group.id)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class GroupAdd(GrouperHandler):
-    def get_form(self, role=None):
+class GroupAdd(GrouperView):
+    def get_form(self, request, role=None):
         """Helper to create a GroupAddForm populated with all users and groups as options.
 
         Note that the first choice is blank so the first user alphabetically
@@ -1088,7 +1102,7 @@ class GroupAdd(GrouperHandler):
             GroupAddForm object.
         """
 
-        form = GroupAddForm(self.request.arguments)
+        form = GroupAddForm(request.POST)
 
         form.role.choices = [["member", "Member"]]
         if role in ("owner", "np-owner"):
@@ -1111,33 +1125,33 @@ class GroupAdd(GrouperHandler):
         )
         return form
 
-    def get(self, group_id=None, name=None):
+    def get(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if not self.current_user.can_manage(group):
-            return self.forbidden()
+            raise PermissionDenied
 
         members = group.my_members()
         my_role = self.current_user.my_role(members)
-        return self.render(
-            "group-add.html", form=self.get_form(role=my_role), group=group
+        return self.render(request, 
+            "group-add.html", form=self.get_form(request, role=my_role), group=group
         )
 
-    def post(self, group_id=None, name=None):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if not self.current_user.can_manage(group):
-            return self.forbidden()
+            raise PermissionDenied
 
         members = group.my_members()
         my_role = self.current_user.my_role(members)
-        form = self.get_form(role=my_role)
+        form = self.get_form(request, role=my_role)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "group-add.html", form=form, group=group,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -1161,7 +1175,7 @@ class GroupAdd(GrouperHandler):
             form.member.errors.append(fail_message)
 
         if form.member.errors:
-            return self.render(
+            return self.render(request, 
                 "group-add.html", form=form, group=group,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -1185,19 +1199,19 @@ class GroupAdd(GrouperHandler):
                          member.name, form.data["role"]),
                      on_group_id=group.id)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class GroupRemove(GrouperHandler):
-    def post(self, group_id=None, name=None):
+class GroupRemove(GrouperView):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if not self.current_user.can_manage(group):
-            return self.forbidden()
+            raise PermissionDenied
 
-        form = GroupRemoveForm(self.request.arguments)
+        form = GroupRemoveForm(request.POST)
         if not form.validate():
             return self.send_error(status_code=400)
 
@@ -1205,7 +1219,7 @@ class GroupRemove(GrouperHandler):
 
         members = group.my_members()
         if not members.get((member_type.capitalize(), member_name), None):
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         removed_member = get_user_or_group(self.session, member_name, user_or_group=member_type)
 
@@ -1219,32 +1233,32 @@ class GroupRemove(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'remove_from_group',
                      '{} was removed from the group.'.format(removed_member.name),
                      on_group_id=group.id, on_user_id=removed_member.id)
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class GroupJoin(GrouperHandler):
-    def get(self, group_id=None, name=None):
+class GroupJoin(GrouperView):
+    def get(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         group_md = self.graph.get_group_details(group.name)
 
         form = GroupJoinForm()
         form.member.choices = self._get_choices(group)
-        return self.render(
+        return self.render(request, 
             "group-join.html", form=form, group=group, audited=group_md["audited"],
         )
 
-    def post(self, group_id=None, name=None):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        form = GroupJoinForm(self.request.arguments)
+        form = GroupJoinForm(request.POST)
         form.member.choices = self._get_choices(group)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "group-join.html", form=form, group=group,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -1258,7 +1272,7 @@ class GroupJoin(GrouperHandler):
             user_can_join = False
             fail_message = e
         if not user_can_join:
-            return self.render(
+            return self.render(request, 
                 "group-join.html", form=form, group=group,
                 alerts=[
                     Alert('danger', fail_message, 'Audit Policy Enforcement')
@@ -1267,7 +1281,7 @@ class GroupJoin(GrouperHandler):
 
         if group.canjoin == "nobody":
             fail_message = 'This group cannot be joined at this time.'
-            return self.render(
+            return self.render(request, 
                 "group-join.html", form=form, group=group,
                 alerts=[
                     Alert('danger', fail_message)
@@ -1317,7 +1331,7 @@ class GroupJoin(GrouperHandler):
         else:
             raise Exception('Need to update the GroupJoin.post audit logging')
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
     def _get_member(self, member_choice):
         member_type, member_name = member_choice.split(": ", 1)
@@ -1360,28 +1374,28 @@ class GroupJoin(GrouperHandler):
         return choices
 
 
-class GroupLeave(GrouperHandler):
-    def get(self, group_id=None, name=None):
+class GroupLeave(GrouperView):
+    def get(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         members = group.my_members()
         if not self.current_user.my_role(members):
-            return self.forbidden()
+            raise PermissionDenied
 
-        return self.render(
+        return self.render(request, 
             "group-leave.html", group=group
         )
 
-    def post(self, group_id=None, name=None):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         members = group.my_members()
         if not self.current_user.my_role(members):
-            return self.forbidden()
+            raise PermissionDenied
 
         group.revoke_member(self.current_user, self.current_user, "User self-revoked.")
 
@@ -1389,33 +1403,33 @@ class GroupLeave(GrouperHandler):
                      '{} left the group.'.format(self.current_user.name),
                      on_group_id=group.id)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class GroupEdit(GrouperHandler):
-    def get(self, group_id=None, name=None):
+class GroupEdit(GrouperView):
+    def get(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if not self.current_user.can_manage(group):
-            return self.forbidden()
+            raise PermissionDenied
 
         form = GroupEditForm(obj=group)
 
-        self.render("group-edit.html", group=group, form=form)
+        return self.render(request, "group-edit.html", group=group, form=form)
 
-    def post(self, group_id=None, name=None):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if not self.current_user.can_manage(group):
-            return self.forbidden()
+            raise PermissionDenied
 
-        form = GroupEditForm(self.request.arguments, obj=group)
+        form = GroupEditForm(request.POST, obj=group)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "group-edit.html", group=group, form=form,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -1432,7 +1446,7 @@ class GroupEdit(GrouperHandler):
             form.groupname.errors.append(
                 "{} already exists".format(form.data["groupname"])
             )
-            return self.render(
+            return self.render(request, 
                 "group-edit.html", group=group, form=form,
                 alerts=self.get_form_alerts(form.errors)
             )
@@ -1440,18 +1454,18 @@ class GroupEdit(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'edit_group',
                      'Edited group.', on_group_id=group.id)
 
-        return self.redirect("/groups/{}".format(group.name))
+        return redirect("/groups/{}".format(group.name))
 
 
-class GroupEnable(GrouperHandler):
-    def post(self, group_id=None, name=None):
+class GroupEnable(GrouperView):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         members = group.my_members()
         if not self.current_user.my_role(members) in ("owner", "np-owner"):
-            return self.forbidden()
+            raise PermissionDenied
 
         group.enable()
         self.session.commit()
@@ -1459,18 +1473,18 @@ class GroupEnable(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'enable_group',
                      'Enabled group.', on_group_id=group.id)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class GroupDisable(GrouperHandler):
-    def post(self, group_id=None, name=None):
+class GroupDisable(GrouperView):
+    def post(self, request, group_id=None, name=None):
         group = Group.get(self.session, group_id, name)
         if not group:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         members = group.my_members()
         if not self.current_user.my_role(members) in ("owner", "np-owner"):
-            return self.forbidden()
+            raise PermissionDenied
 
         group.disable()
         self.session.commit()
@@ -1478,31 +1492,31 @@ class GroupDisable(GrouperHandler):
         AuditLog.log(self.session, self.current_user.id, 'disable_group',
                      'Disabled group.', on_group_id=group.id)
 
-        return self.redirect("/groups/{}?refresh=yes".format(group.name))
+        return redirect("/groups/{}?refresh=yes".format(group.name))
 
 
-class PublicKeyAdd(GrouperHandler):
-    def get(self, user_id=None, name=None):
+class PublicKeyAdd(GrouperView):
+    def get(self, request, user_id=None, name=None):
         user = User.get(self.session, user_id, name)
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if (user.name != self.current_user.name) and not self.current_user.user_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
-        self.render("public-key-add.html", form=PublicKeyForm(), user=user)
+        return self.render(request, "public-key-add.html", form=PublicKeyForm(), user=user)
 
-    def post(self, user_id=None, name=None):
+    def post(self, request, user_id=None, name=None):
         user = User.get(self.session, user_id, name)
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if (user.name != self.current_user.name) and not self.current_user.user_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
-        form = PublicKeyForm(self.request.arguments)
+        form = PublicKeyForm(request.POST)
         if not form.validate():
-            return self.render(
+            return self.render(request, 
                 "public-key-add.html", form=form, user=user,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -1523,7 +1537,7 @@ class PublicKeyAdd(GrouperHandler):
             form.public_key.errors.append(
                 "Key already in use. Public keys must be unique."
             )
-            return self.render(
+            return self.render(request, 
                 "public-key-add.html", form=form, user=user,
                 alerts=self.get_form_alerts(form.errors),
             )
@@ -1540,35 +1554,35 @@ class PublicKeyAdd(GrouperHandler):
             "action": "added",
         })
 
-        return self.redirect("/users/{}?refresh=yes".format(user.name))
+        return redirect("/users/{}?refresh=yes".format(user.name))
 
 
-class PublicKeyDelete(GrouperHandler):
-    def get(self, user_id=None, name=None, key_id=None):
+class PublicKeyDelete(GrouperView):
+    def get(self, request, user_id=None, name=None, key_id=None):
         user = User.get(self.session, user_id, name)
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if (user.name != self.current_user.name) and not self.current_user.user_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
         key = self.session.query(PublicKey).filter_by(id=key_id, user_id=user.id).scalar()
         if not key:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
-        self.render("public-key-delete.html", user=user, key=key)
+        return self.render(request, "public-key-delete.html", user=user, key=key)
 
-    def post(self, user_id=None, name=None, key_id=None):
+    def post(self, request, user_id=None, name=None, key_id=None):
         user = User.get(self.session, user_id, name)
         if not user:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         if (user.name != self.current_user.name) and not self.current_user.user_admin:
-            return self.forbidden()
+            raise PermissionDenied
 
         key = self.session.query(PublicKey).filter_by(id=key_id, user_id=user.id).scalar()
         if not key:
-            return self.notfound()
+            return HttpResponse("404") # XXX(lfaraone)
 
         key.delete(self.session)
         self.session.commit()
@@ -1583,18 +1597,18 @@ class PublicKeyDelete(GrouperHandler):
             "action": "removed",
         })
 
-        return self.redirect("/users/{}?refresh=yes".format(user.name))
+        return redirect("/users/{}?refresh=yes".format(user.name))
 
 
-class Help(GrouperHandler):
-    def get(self):
+class Help(GrouperView):
+    def get(self, request):
         permissions = (
             self.session.query(Permission)
             .order_by(Permission.name)
         )
         d = {permission.name: permission for permission in permissions}
 
-        self.render("help.html",
+        return self.render(request, "help.html",
                     how_to_get_help=settings.how_to_get_help,
                     site_docs=settings.site_docs,
                     grant_perm=d[PERMISSION_GRANT],
@@ -1605,10 +1619,10 @@ class Help(GrouperHandler):
 # Don't use GraphHandler here as we don't want to count
 # these as requests.
 class Stats(RequestHandler):
-    def get(self):
+    def get(self, request):
         return self.write(stats.to_dict())
 
 
-class NotFound(GrouperHandler):
-    def get(self):
-        return self.notfound()
+class NotFound(GrouperView):
+    def get(self, request):
+        return HttpResponse("404") # XXX(lfaraone)

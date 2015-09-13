@@ -14,4 +14,4 @@
 {{ form_field(form.expiration, 3, 8, class_="form-control", placeholder="MM/DD/YYYY") }}
 {{ form_field(form.reason, 3, 8, class_="form-control", rows="5") }}
 
-{{ xsrf_form() }}
+<input type="hidden" name="csrfmiddlewaretoken" value="{{ csrf_token }}"/>

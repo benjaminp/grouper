@@ -1,3 +1,5 @@
+from django.shortcuts import redirect, render
+
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from email.mime.multipart import MIMEMultipart
@@ -13,14 +15,18 @@ import sys
 import tornado.web
 import traceback
 import urllib
+import yaml
 
 from .settings import settings
+from ..settings import default_settings_path
 from ..constants import AUDIT_SECURITY, RESERVED_NAMES
 from ..graph import Graph
 from ..models import (
     User, GROUP_EDGE_ROLES, OBJ_TYPES_IDX, get_db_engine, Session, AsyncNotification, get_plugins,
 )
 from ..util import get_database_url
+
+from django.views.generic import View
 
 
 class Alert(object):
@@ -41,14 +47,38 @@ class InvalidUser(Exception):
     pass
 
 
-class GrouperHandler(tornado.web.RequestHandler):
-    def initialize(self):
+class Application(object):
+    def __init__(self):
+        template_env = get_template_env(deployment_name="")
+
+        Session.configure(bind=get_db_engine("sqlite:///grouper.sqlite"))
+
+        logging.info("Initilializing graph data.")
+        session = Session()
+        graph = Graph()
+        graph.update_from_db(session)
+        session.close()
+
+        self.my_settings = {
+            "db_session": Session,
+            "template_env": template_env,
+        }
+
+
+class GrouperView(View):
+    def __init__(self, *args, **kwargs):
+        super(GrouperView, self).__init__(*args, **kwargs)
+        self.application = Application()
+
+    def dispatch(self, *args, **kwargs):
         self.session = self.application.my_settings.get("db_session")()
         self.graph = Graph()
 
         self._request_start_time = datetime.utcnow()
         stats.incr("requests")
         stats.incr("requests_{}".format(self.__class__.__name__))
+
+        return super(GrouperView, self).dispatch(*args, **kwargs)
 
     # TODO(mildorf): why not just override self.log_exception(typ, value, tb)?
     def _handle_request_exception(self, e):
@@ -66,12 +96,15 @@ class GrouperHandler(tornado.web.RequestHandler):
     # The refresh argument can be added to any page.  If the handler for that
     # route calls this function, it will sync its graph from the database if
     # requested.
-    def handle_refresh(self):
-        if self.get_argument("refresh", "no").lower() == "yes":
+    def handle_refresh(self, ):#request):
+        # XXX
+        return True
+        if request.GET.get("refresh", "no").lower() == "yes":
             self.graph.update_from_db(self.session)
 
-    def get_current_user(self):
-        username = self.request.headers.get(settings.user_auth_header)
+    @property
+    def current_user(self):
+        username = "admin@example.com" # XXX self.request.headers.get(settings.user_auth_header)
         if not username:
             return
 
@@ -117,7 +150,8 @@ class GrouperHandler(tornado.web.RequestHandler):
         stats.incr("response_status_{}_{}".format(self.__class__.__name__, response_status))
 
     def update_qs(self, **kwargs):
-        qs = self.request.arguments.copy()
+        return "XXX fixme"
+        qs = request.arguments.copy()
         qs.update(kwargs)
         return "?" + urllib.urlencode(qs, True)
 
@@ -128,11 +162,10 @@ class GrouperHandler(tornado.web.RequestHandler):
         return ""
 
     def get_template_namespace(self):
-        namespace = super(GrouperHandler, self).get_template_namespace()
+        namespace = {} # XXX lfaraone super(GrouperHandler, self).get_template_namespace()
         namespace.update({
             "update_qs": self.update_qs,
             "is_active": self.is_active,
-            "xsrf_form": self.xsrf_form_html,
             "alerts": [],
         })
         return namespace
@@ -142,11 +175,13 @@ class GrouperHandler(tornado.web.RequestHandler):
         content = template.render(kwargs)
         return content
 
-    def render(self, template_name, **kwargs):
+    def render(self, request, template_name, **kwargs):
         context = {}
         context.update(self.get_template_namespace())
         context.update(kwargs)
-        self.write(self.render_template(template_name, **context))
+        # XXX
+        context["current_user"] = self.current_user
+        return render(request, template_name, context)
 
     def send_email(self, recipients, subject, template, context):
         """Construct a message object from a template and schedule
@@ -254,6 +289,7 @@ class GrouperHandler(tornado.web.RequestHandler):
                 alerts.append(Alert("danger", error, field))
         return alerts
 
+    # XXX(lfaraone)
     # TODO(gary): Add json error responses.
     def badrequest(self, format_type=None):
         self.set_status(400)
@@ -340,8 +376,9 @@ def highest_period_delta_str(delta):
     return None
 
 
-def get_template_env(package="grouper.fe", deployment_name="",
-                     extra_filters=None, extra_globals=None):
+def get_template_env(package="grouper.frontend", deployment_name="",
+                     extra_filters=None, extra_globals=None,
+                     *args, **kwargs):
     filters = {
         "print_date": print_date,
         "expires_when_str": expires_when_str,
@@ -359,7 +396,8 @@ def get_template_env(package="grouper.fe", deployment_name="",
     if extra_globals:
         j_globals.update(extra_globals)
 
-    env = Environment(loader=PackageLoader(package, "templates"))
+    kwargs['loader'] = PackageLoader(package, "templates")
+    env = Environment(*args, **kwargs)
     env.filters.update(filters)
     env.globals.update(j_globals)
 
