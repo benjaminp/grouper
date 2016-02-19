@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import operator
 
+import sys
 from expvar.stats import stats
 from tornado.web import RequestHandler
 from sqlalchemy import union_all
@@ -1720,6 +1721,7 @@ class UserTokenAdd(GrouperHandler):
             token.add(self.session)
             self.session.commit()
         except IntegrityError:
+            self.log_exception(*sys.exc_info())
             self.session.rollback()
             form.name.errors.append(
                 "Name already in use."
